@@ -1,0 +1,169 @@
+install.packages("countrycode")
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library (purrr)
+library(countrycode)
+
+# Load your data
+df <- read_csv("~/Downloads/IO_membership_detailsV4.csv")
+
+# PART ONE: transform country names into country codes -- include notes about country changes/splits
+# Define manual mapping for edge cases
+name_cleanup_map <- c(
+  "Brunei" = "Brunei Darussalam",
+  "Syria" = "Syrian Arab Republic",
+  "United Arab Emirates" = "UAE",
+  "uae" = "United Arab Emirates",
+  "Türkiye" = "Turkey",
+  "Ivorycoast" = "Côte d’Ivoire",
+  "Trinidad" = "Trinidad and Tobago",
+  "St. Kitts" = "Saint Kitts and Nevis",
+  "St. Vincent" = "Saint Vincent and the Grenadines",
+  "Congo-Brazz" = "Congo",
+  "Zaire" = "Democratic Republic of the Congo",
+  "São Tomé" = "São Tomé and Príncipe",
+  "Swaziland" = "Eswatini",
+  "Bosnia" = "Bosnia and Herzegovina",
+  "Car" = "Central African Republic",
+  "CAR" = "Central African Republic", 
+  "FYRO Macedonia" = "North Macedonia",
+  "North Macedonia" = "Macedonia",
+  "Etimor" = "Timor-Leste",
+  "Yugoslaviaserb" = "Serbia",
+  "Soafrica" = "South Africa", 
+  "Sokorea" = "South Korea",
+  "Micronesiafs" = "Micronesia",
+  "Micronesiansns" = "Micronesia",
+  "Micronesians" = "Micronesia", 
+  "Stlucia" = "St. Lucia",
+  "Uk"= "United Kingdom",
+  "Nokorea" = "North Korea",
+  "Domrepublic" = "Dominican Republic",
+  "Wsamoa" = "Samoa",
+  "Republic of Kosovo" = "Kosovo"
+)
+
+# ISO3 overrides
+iso3_override_map <- c(
+  "Kosovo" = "XKX",
+  "Micronesia" = "FSM",
+  "Turkey" = "TUR"
+)
+  
+# Convert to ISO3
+convert_to_iso <- function(members) {
+  country_list <- str_split(members, pattern = "[,;\n]")[[1]] %>%
+    str_trim() %>%
+    str_remove_all("(?i)\\b(The|Republic of|Arab Republic of|Federal Republic of)\\b") %>%
+    str_squish() %>%
+    str_replace_all(name_cleanup_map)
+    
+  iso_list <- countrycode(
+    country_list,
+    origin = "country.name",
+    destination = "iso3c",
+    custom_match = iso3_override_map
+   )
+    
+  unmatched <- country_list[is.na(iso_list)]
+  iso_string <- paste(na.omit(iso_list), collapse = ", ")
+  unmatched_string <- if (length(unmatched) > 0) paste(unmatched, collapse = ", ") else NA
+    
+  return(
+    list(
+      iso = iso_string,
+      unmatched = unmatched_string
+    )
+  )
+}
+
+results <- map(df$member_states, convert_to_iso)
+
+df <- df %>%
+  mutate(
+    member_states_iso = map_chr(results, "iso"),
+    unmatched_countries = map_chr(results, "unmatched")
+  )
+
+# dealing with Turkey issue
+df <- df %>%
+  mutate(
+    member_states_iso = ifelse(
+      str_detect(unmatched_countries, fixed("T�rkiye")),
+      paste0(member_states_iso, ifelse(member_states_iso == "", "TUR", ", TUR")),
+      member_states_iso
+    ),
+    unmatched_countries = ifelse(
+      str_detect(unmatched_countries, fixed("T�rkiye")),
+      str_remove(unmatched_countries, fixed("T�rkiye")) %>% str_remove("^,\\s*") %>% str_remove(",\\s*$"),
+      unmatched_countries
+    )
+  )
+
+df %>% filter(!is.na(unmatched_countries)) %>% View()
+
+# PART TWO: make each country its own column & change entire dataset to long format
+# Step 1: Remove unneeded columns
+df_cleanedv1 <- df %>%
+  select(ioname, year, member_states_iso, start_year)
+
+# Convert ISO list string to a list column
+df_cleanedv2 <- df_cleanedv1 %>%
+  mutate(member_states_iso = str_split(member_states_iso, ",\\s*"))
+
+# Find unique ISO codes across all IOs & sort alphabetically
+all_iso_codes <- df_cleanedv2 %>%
+  pull(member_states_iso) %>%
+  unlist() %>%
+  unique() %>%
+  sort()
+
+# Step 3: Expand each IO into all its applicable years
+df_expanded <- df_cleanedv2 %>%
+  select(-year) %>% 
+  rowwise() %>%
+  mutate(
+    start_year = as.numeric(start_year),
+    year_seq = list(seq(from = max(2005, start_year), to = 2024))
+  ) %>%
+  unnest(year_seq) %>%
+  rename(year = year_seq) %>%      # year = the generated year
+  select(-start_year) %>%         # drop start_year but keep everything else
+  ungroup()
+
+# Step 4: Clean ISO codes — remove empty strings or NAs
+all_iso_codes <- df_cleanedv2 %>%
+  pull(member_states_iso) %>%
+  unlist() %>%
+  na.omit() %>%
+  .[. != ""] %>%
+  unique() %>%
+  sort()
+
+# final step !!
+# Create a safe helper function to return a 1-row tibble with names
+make_country_row <- function(iso_list, all_iso_codes) {
+  # Default to 0s
+  flags <- setNames(rep(0, length(all_iso_codes)), all_iso_codes)
+  
+  # Replace if valid list
+  if (!is.null(iso_list) && length(iso_list) > 0) {
+    iso_list <- iso_list[!is.na(iso_list) & iso_list != ""]
+    flags <- setNames(as.integer(all_iso_codes %in% iso_list), all_iso_codes)
+  }
+  
+  # Always return 1-row tibble with correct names
+  tibble::as_tibble_row(flags)
+}
+
+# Build row-by-row country membership flags
+country_matrix <- map_dfr(df_expanded$member_states_iso, ~make_country_row(.x, all_iso_codes))
+
+# Join back with main metadata
+df_binary_final <- bind_cols(
+  df_expanded %>% select(ioname, year),
+  country_matrix
+)
+
+View(df_binary)
